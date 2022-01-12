@@ -42,7 +42,7 @@ def creation_tubes():
         print("Tube secondaire non cree car il existe deja.")
 
 
-# Pour la fermeture controlee avec Ctrl+C
+# Pour la fermeture controlee avec Ctrl+C
 def signal_handler_exit(sig, frame):
 
     try:
@@ -51,7 +51,7 @@ def signal_handler_exit(sig, frame):
     except Exception:
         pass
     
-    # Fermeture du segment memoire partage
+    # Fermeture du segment memoire partage
     try:
         shm.close()
         shm.unlink()
@@ -75,9 +75,27 @@ def supprimer_tubes():
     if os.path.exists(PATHTUBE2):
         os.unlink(PATHTUBE2)
 
+# Lorsque le WatchDog recoit une reponse de la part du serveur principal
+def handle_watchdog_principal():
+    return 0
+
+# Lorsque le WatchDog recoit une reponse de la part du serveur secondaire
+def handle_watchdog_secondaire():
+    return 0
 
 # Traitement pour le deploiement du watchdog
 def processus_watchdog_traitement():
+
+    # demarrage serveur 1 (communication avec le SP)
+    Thread(target=start_server, args=[handle_watchdog_principal, PORT_WATCHDOG_PRINCIPAL]).start()
+    
+    # demarrage serveur 2 (communication avec le SS)
+    Thread(target=start_server, args=[handle_watchdog_secondaire, PORT_WATCHDOG_SECONDAIRE]).start()
+    
+    # Boucle pour communiquer avec les serveurs
+    while True:
+        print("Coucou du WD")
+        time.sleep(SLEEP_TIME * 3)
     return 0
 
 
@@ -97,8 +115,8 @@ async def handle_client(reader, writer):
 
 
 # Fonction qui demarre le serveur Socket en asynchrone
-async def run_server_socket():
-    server = await asyncio.start_server(handle_client, HOST, PORT_SERVER_CLIENT)
+async def run_server_socket(handle_fonction, port):
+    server = await asyncio.start_server(handle_fonction, HOST, port)
     print(f'\nServeur socket démarré sur : {server.sockets[0].getsockname()}\n')
     async with server:
         await server.serve_forever()
@@ -106,12 +124,12 @@ async def run_server_socket():
 
 
 # Cette fonction fait appel a la fonction asynchrone permettant de demarrer le serveur
-def start_server() -> None:
+def start_server(handle_fonction, port) -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     # Trigger run_server_socket() en asynchrone
-    loop.run_until_complete(run_server_socket())
+    loop.run_until_complete(run_server_socket(handle_fonction, port))
     
     # Fermeture de la loop une fois terminee
     loop.close()
@@ -141,7 +159,7 @@ def processus_pere_traitement() -> None:
     elif pid_watchdog < 0: # Si erreur lors du fork()
         print("Erreur lors du fork() pour le watchdog")
     elif pid_watchdog > 1: # Pere
-        Thread(target=start_server).start()
+        Thread(target=start_server, args=[handle_client, PORT_SERVER_CLIENT]).start()
         i = 0
         while True:
             try:
@@ -220,7 +238,7 @@ except OSError as e: # Si erreur il y a, le script s'arrete et ferme les fichier
     print("Creation du processus fils impossible, arret du script.\n" + str(e))
     signal_handler_exit(None, None)
 
-# Processus parent : serveur principal
+# Processus parent : serveur principal
 if pid > 0:
     processus_pere_traitement()
 elif pid == 0: # Processus fils, serveur secondaire
