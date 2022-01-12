@@ -1,182 +1,230 @@
+#!/usr/bin/env python3
 import os
-import sys
 import time
-import socket
 import signal
 import asyncio
 import numpy as np
 from multiprocessing import shared_memory
+from threading import Thread
 
 """ Definition des constantes """
-pathtube1 = "/tmp/tube_P-S.fifo"
-pathtube2 = "/tmp/tube_S-P.fifo"
-values_shm_ini = np.array([1, 0, 1, 0, 0, 1])
 
+# Chemins d'acces
+PATHTUBE1 = "/tmp/tube_P-S.fifo"
+PATHTUBE2 = "/tmp/tube_S-P.fifo"
+PATH_SHM = "/dev/shm/segment_mm"
+
+# Valeurs par defaut du shm
+INI_SHM = np.array([1, 0, 1, 0, 0, 1])
+
+# Constantes pour les serveurs Socket
 HOST = '127.0.0.1'
 PORT_SERVER_CLIENT = 3333
 PORT_WATCHDOG_PRINCIPAL = 1111
 PORT_WATCHDOG_SECONDAIRE = 2222
 
+# Temps de battement pour la communication par tubes nommes
 SLEEP_TIME = 0.5
 
+# Creation des tubes de facon securisee
 def creation_tubes():
-    """ Creation des tubes de facon securisee """
+
+    # Tube principal
     try:
-        os.mkfifo(pathtube1, 0o0600)
+        os.mkfifo(PATHTUBE1, 0o0600)
     except OSError:
         print("Tube principal non cree car il existe deja.")
 
+    # Tube secondaire
     try:
-        os.mkfifo(pathtube2, 0o0600)
+        os.mkfifo(PATHTUBE2, 0o0600)
     except OSError:
         print("Tube secondaire non cree car il existe deja.")
 
-# Pour la fermeture controlee avec Ctrl+C
+
+# Pour la fermeture controlee avec Ctrl+C
 def signal_handler_exit(sig, frame):
-    print('\nArret du script, vous avez Ctrl+C!')
 
-    supprimer_tubes()
-
-    # Fermeture du segment memoire partage
-    shm.close()
-    shm.unlink()
-
+    try:
+        # Fermeture et suppression des tubes nommes
+        supprimer_tubes()
+    except Exception:
+        pass
+    
+    # Fermeture du segment memoire partage
+    try:
+        shm.close()
+        shm.unlink()
+    except Exception:
+        pass
+    
+    # Clear la console
+    # TODO Supprimer le clear (supprime les messages d'erreur)
+    #os.system('cls' if os.name == 'nt' else 'clear')
+    
+    # Terminer l'execution
     os._exit(0)
 
-def supprimer_tubes():
-    # Fermeture des tubes nommes
-    if os.path.exists(pathtube1):
-        os.unlink(pathtube1)
-    if os.path.exists(pathtube2):
-        os.unlink(pathtube2)
 
+# Fermeture et suppression des tubes nommes
+def supprimer_tubes():
+    
+    # On verifie d'abord que le chemin d'acces au tube est valide et que les tubes existent
+    if os.path.exists(PATHTUBE1):
+        os.unlink(PATHTUBE1)
+    if os.path.exists(PATHTUBE2):
+        os.unlink(PATHTUBE2)
+
+
+# Traitement pour le deploiement du watchdog
 def processus_watchdog_traitement():
     return 0
 
-async def handle_client(reader,writer):
-    request = None
-    print("1")
-    while request != 'quit':
-        request = (reader.read(255)).decode('utf8')
-        print("2")
-        print('recu : ' + str(request))
-        response = str('OK ' + request) + '\n'
-        writer.write(response.encode('utf8'))
-        await writer.drain()
+
+# Fonction qui gere le traitement lorsqu'un message client est recu par le serveur Socket
+# Utilise l'asynchronisme
+async def handle_client(reader, writer):
+    data = await reader.read(100)
+    message = data.decode()
+    addr = writer.get_extra_info('peername')
+
+    print(f"Message client recu de {addr!r} : {message!r}\n")
+
+    # Message de retour
+    writer.write(("Vous avez ecrit : " + data.decode()).encode())
+    await writer.drain()
     writer.close()
 
+
+# Fonction qui demarre le serveur Socket en asynchrone
 async def run_server_socket():
-    print("RUn serv")
     server = await asyncio.start_server(handle_client, HOST, PORT_SERVER_CLIENT)
-    print('runned')
+    print(f'\nServeur socket démarré sur : {server.sockets[0].getsockname()}\n')
     async with server:
         await server.serve_forever()
+    return server
 
 
-def processus_pere_traitement():
+# Cette fonction fait appel a la fonction asynchrone permettant de demarrer le serveur
+def start_server() -> None:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Trigger run_server_socket() en asynchrone
+    loop.run_until_complete(run_server_socket())
+    
+    # Fermeture de la loop une fois terminee
+    loop.close()
+
+# Traitement pour le processus pere (serveur principal SP)
+# Le SP va utiliser le segment memoire partage et les tubes nommes pour communiquer avec son fils
+# Le SP est egalement responsable du lancement du serveur socket pour les connexions clients
+# et du lancement du WatchDog.
+def processus_pere_traitement() -> None:
+
+    # Gestion du Ctrl + C (arret du script + fermeture des flux)
     signal.signal(signal.SIGINT, signal_handler_exit)
+    
+    # Recuperation du segment memoire partage
     shm_parent = shared_memory.SharedMemory(name=shm.name)
 
+    # Demarrage du WatchDog de facon securisee
     pid_watchdog = -1
     try:
         pid_watchdog = os.fork()
-        if pid_watchdog < 0:
-            print("Erreur lors du fork()")
-            os.abort()
     except OSError as e:
         print("Creation du processus fils impossible, arret du script.\n" + str(e))
-        os.abort()
-    
-    if pid_watchdog == 0: # Fils
-        processus_watchdog_traitement()
-        os.abort()
-    elif pid_watchdog > 1: # Pere
+        signal_handler_exit(None, None)
 
-        print("TEst")
-        asyncio.run(run_server_socket())
-        print("LOl")
+    if pid_watchdog == 0: # Processus fils (WatchDog)
+        processus_watchdog_traitement() # Traitement du watchdog
+    elif pid_watchdog < 0: # Si erreur lors du fork()
+        print("Erreur lors du fork() pour le watchdog")
+    elif pid_watchdog > 1: # Pere
+        Thread(target=start_server).start()
         i = 0
         while True:
             try:
-                fifo1 = open(pathtube1, "w")
-                fifo2 = open(pathtube2, "r")
+                fifo1 = open(PATHTUBE1, "w")
+                fifo2 = open(PATHTUBE2, "r")
             except Exception as e:
                 print("Erreur lors de l'ouverture des tubes, arret du script.\n" + str(e))
                 os._exit(1)
             
             fifo1.write("Message " + str(i) + " du processus principal !\n")
-            fifo1.flush()
+            fifo1.flush() # Pour regler les problemes de buffers lie aux tubes
 
             print("Message recu : " + fifo2.readline())
 
-            fifo2.flush()
+            fifo2.flush() # Pour regler les problemes de buffers lie aux tubes
 
             i += 1
             time.sleep(SLEEP_TIME)
 
+# Traitement pour le processus fils (serveur secondaire)
+# Communique en alternance avec le serveur principal via les tubes nommes et le segment memoire partage
+def processus_fils_traitement() -> None:
 
-        # Le processus pere est le premier a se terminer
-        shm_parent.close()
-        shm_parent.unlink()
+    # Gestion du Ctrl + C
+    signal.signal(signal.SIGINT, signal_handler_exit)
+    
+    # Recuperation du segment memoire partage
+    shm_fils = shared_memory.SharedMemory(name=shm.name)
+    
+    i = 0
+    while True:
+        try:
+            fifo1 = open(PATHTUBE1, "r")
+            fifo2 = open(PATHTUBE2, "w")
+        except Exception as e:
+            print("Erreur lors de l'ouverture des tubes, arret du script.\n" + str(e))
+            signal_handler_exit(None, None)
 
-def processus_fils_traitement():
-    try:
-        shm_fils = shared_memory.SharedMemory(name=shm.name)
-        i = 0
-        while True:
-            try:
-                fifo1 = open(pathtube1, "r")
-                fifo2 = open(pathtube2, "w")
-            except Exception as e:
-                print("Erreur lors de l'ouverture des tubes, arret du script.\n" + str(e))
-                os._exit(1)
+        print("Message recu : " + fifo1.readline())
 
-            print("Message recu : " + fifo1.readline())
-
-            fifo1.flush()
-
-            fifo2.write("Message " + str(i) + " du processus secondaire !\n")
-            fifo2.flush()
-
-            i += 1
-            
-        print ("Le père boucle...")
-        shm_fils.close()
-    except KeyboardInterrupt:
-        os.abort()
+        fifo1.flush() # Pour regler les problemes de buffers lie aux tubes
+        fifo2.write("Message " + str(i) + " du processus secondaire !\n")
+        fifo2.flush() # Pour regler les problemes de buffers lie aux tubes
+        i += 1
 
 
+""" ==================== [ MAIN ] ===================="""
+""" 
+    Partie principale du script
+    Initialisation du segment memoire partage (SHM)
+    Initialisation des tubes nommes
+    Demarrage du serveur principal
+    Demarrage du serveur secondaire               
+                                                      """
+"""==================================================="""
 
+# Suppression de l'ancien segment memoire partage s'il y en a un
 try:
-    os.unlink('/dev/shm/segment_mm')
+    os.unlink(PATH_SHM)
 except Exception:
     pass
 
-# Creation du segment memoire
-shm = shared_memory.SharedMemory(create=True, size=values_shm_ini.nbytes, name="segment_mm")
-b = np.ndarray(values_shm_ini.shape, dtype=values_shm_ini.dtype, buffer=shm.buf)
-b[:] = values_shm_ini[:]
+# Creation du nouveau segment memoire partage
+shm = shared_memory.SharedMemory(create=True, size=INI_SHM.nbytes, name="segment_mm")
+b = np.ndarray(INI_SHM.shape, dtype=INI_SHM.dtype, buffer=shm.buf)
+b[:] = INI_SHM[:]
 
+# Initialisation des tubes nommes
 creation_tubes()
 
+# Creation d'un fork pour accueillir le serveur secondaire
 pid = -1
 try:
     pid = os.fork()
-    if pid < 0:
-        print("Erreur lors du fork()")
-        os.abort()
-except OSError as e:
+except OSError as e: # Si erreur il y a, le script s'arrete et ferme les fichiers actuellement ouverts
     print("Creation du processus fils impossible, arret du script.\n" + str(e))
-    os.abort()
+    signal_handler_exit(None, None)
 
-# Parent
+# Processus parent : serveur principal
 if pid > 0:
     processus_pere_traitement()
-    os.abort()
-elif pid == 0: # Fils
+elif pid == 0: # Processus fils, serveur secondaire
     processus_fils_traitement()
-    os.abort()
-else:
-    os.abort()
-
-supprimer_tubes()
+else: # Cas d'erreur lors du fork, ne devrait pas arriver, traitement de securite
+    print("Erreur lors du fork()")
+    signal_handler_exit(None, None)
