@@ -26,6 +26,20 @@ PORT_WATCHDOG_SECONDAIRE = 2222
 # Temps de battement pour la communication par tubes nommes
 SLEEP_TIME = 0.5
 
+class EchoClientProtocol(asyncio.Protocol):
+    def __init__(self, message, on_con_lost):
+        self.message = message
+        self.on_con_lost = on_con_lost
+
+    def connection_made(self, transport):
+        transport.write(self.message.encode())
+
+    def data_received(self, data):
+        print('{!r}'.format(data.decode()))
+
+    def connection_lost(self, exc):
+        self.on_con_lost.set_result(True)
+
 # Creation des tubes de facon securisee
 def creation_tubes():
 
@@ -59,8 +73,7 @@ def signal_handler_exit(sig, frame):
         pass
     
     # Clear la console
-    # TODO Supprimer le clear (supprime les messages d'erreur)
-    #os.system('cls' if os.name == 'nt' else 'clear')
+    os.system('cls' if os.name == 'nt' else 'clear')
     
     # Terminer l'execution
     os._exit(0)
@@ -76,12 +89,30 @@ def supprimer_tubes():
         os.unlink(PATHTUBE2)
 
 # Lorsque le WatchDog recoit une reponse de la part du serveur principal
-def handle_watchdog_principal():
-    return 0
-
+async def handle_watchdog_principal(reader, writer):
+    # Reception du message du SP (msg = "SP_OK", en theorie)
+    data = await reader.read(100)
+    message = data.decode()
+    
+    msg_retour = "[WD] - WD_CONTROLE_SP_OK" if message == "SP_OK" else "[WD] - WD_CONTROL_SP_DOWN"
+    
+    # Renvoyer message au SP
+    writer.write((msg_retour).encode())
+    await writer.drain()
+    writer.close()
+    
 # Lorsque le WatchDog recoit une reponse de la part du serveur secondaire
-def handle_watchdog_secondaire():
-    return 0
+async def handle_watchdog_secondaire(reader, writer):
+    # Reception du message du SS (msg = "SS_OK", en theorie)
+    data = await reader.read(100)
+    message = data.decode()
+    
+    msg_retour = "[WD] - WD_CONTROLE_SS_OK" if message == "SS_OK" else "[WD] - WD_CONTROL_SS_DOWN"
+    
+    # Renvoyer message au SP
+    writer.write((msg_retour).encode())
+    await writer.drain()
+    writer.close()
 
 # Traitement pour le deploiement du watchdog
 def processus_watchdog_traitement():
@@ -94,10 +125,8 @@ def processus_watchdog_traitement():
     
     # Boucle pour communiquer avec les serveurs
     while True:
-        print("Coucou du WD")
+        print("[WD] STATUS - UP\n")
         time.sleep(SLEEP_TIME * 3)
-    return 0
-
 
 # Fonction qui gere le traitement lorsqu'un message client est recu par le serveur Socket
 # Utilise l'asynchronisme
@@ -113,15 +142,13 @@ async def handle_client(reader, writer):
     await writer.drain()
     writer.close()
 
-
 # Fonction qui demarre le serveur Socket en asynchrone
 async def run_server_socket(handle_fonction, port):
     server = await asyncio.start_server(handle_fonction, HOST, port)
-    print(f'\nServeur socket démarré sur : {server.sockets[0].getsockname()}\n')
+    print(f'Serveur socket démarré sur : {server.sockets[0].getsockname()}\n')
     async with server:
         await server.serve_forever()
     return server
-
 
 # Cette fonction fait appel a la fonction asynchrone permettant de demarrer le serveur
 def start_server(handle_fonction, port) -> None:
@@ -130,6 +157,30 @@ def start_server(handle_fonction, port) -> None:
 
     # Trigger run_server_socket() en asynchrone
     loop.run_until_complete(run_server_socket(handle_fonction, port))
+    
+    # Fermeture de la loop une fois terminee
+    loop.close()
+
+async def async_communiquer_watchdog(msg: str, port: int, pid: int) -> None:
+    loop = asyncio.get_running_loop()
+
+    on_con_lost = loop.create_future()
+
+    transport, protocol = await loop.create_connection(
+        lambda: EchoClientProtocol(msg, on_con_lost),
+        '127.0.0.1', port)
+
+    try:
+        await on_con_lost
+    finally:
+        transport.close()
+        
+def communiquer_watchdog(msg: str, port: int, pid: int) -> None:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Trigger run_server_socket() en asynchrone
+    loop.run_until_complete(async_communiquer_watchdog(msg, port, pid))
     
     # Fermeture de la loop une fois terminee
     loop.close()
@@ -160,8 +211,17 @@ def processus_pere_traitement() -> None:
         print("Erreur lors du fork() pour le watchdog")
     elif pid_watchdog > 1: # Pere
         Thread(target=start_server, args=[handle_client, PORT_SERVER_CLIENT]).start()
+        
+        connecte = False
         i = 0
         while True:
+            try:
+                if not connecte and i > 0:
+                    Thread(target=communiquer_watchdog, args=["SP_OK", 1111, os.getpid()]).start()
+                    connected = True
+            except Exception as e:
+                continue
+
             try:
                 fifo1 = open(PATHTUBE1, "w")
                 fifo2 = open(PATHTUBE2, "r")
@@ -189,8 +249,16 @@ def processus_fils_traitement() -> None:
     # Recuperation du segment memoire partage
     shm_fils = shared_memory.SharedMemory(name=shm.name)
     
+    connecte = False
     i = 0
     while True:
+        try:
+            if not connecte and i > 1:
+                Thread(target=communiquer_watchdog, args=["SS_OK", 2222, os.getpid()]).start()
+                connected = True
+        except Exception as e:
+            continue
+
         try:
             fifo1 = open(PATHTUBE1, "r")
             fifo2 = open(PATHTUBE2, "w")
